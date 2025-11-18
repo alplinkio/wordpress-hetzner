@@ -5,7 +5,7 @@ with lib;
 let
   cfg = config.services.wpbox.mariadb;
   wpCfg = config.services.wpbox.wordpress;
-  
+
   getDetectedRamMb = 
     let
       ramFile = "/run/wpbox/detected-ram-mb";
@@ -14,7 +14,7 @@ let
     if config.hardware.runtimeMemoryMb != null 
     then config.hardware.runtimeMemoryMb
     else fallbackRam;
-    
+
   getDetectedCores =
     let
       coresFile = "/run/wpbox/detected-cores";
@@ -51,12 +51,10 @@ in
       totalMaxChildren = max 2 (availablePhpRamMb / avgProcessMb);
       safeSiteCount = if numberOfSites > 0 then numberOfSites else 1;
       calculatedChildrenPerSite = max 2 (floor (totalMaxChildren / safeSiteCount));
-      
       phpFpmRamMb = calculatedChildrenPerSite * avgProcessMb * safeSiteCount;
 
       # --- 2. CALCULATE DB BUDGET ---
       availableRamMb = lib.max 512 (systemRamMb - phpFpmRamMb - reservedRamMb);
-      
       # Final budget for MariaDB
       dbBudgetMb = builtins.floor(availableRamMb * cfg.autoTune.ramAllocationRatio);
 
@@ -65,10 +63,7 @@ in
       # InnoDB Buffer Pool: 70% of DB budget (max 16GB for small servers)
       innodbBufferPoolSizeMb = lib.min 16384 (builtins.floor(dbBudgetMb * 0.70));
       
-      # Query Cache
-      queryCacheSizeMb = lib.min 128 (builtins.floor(dbBudgetMb * 0.05));
-      
-      # Tmp Table Size
+      # Tmp Table Size (Query Cache rimossa)
       tmpTableSizeMb = if dbBudgetMb > 2048 then 128 else 64;
       maxHeapTableSizeMb = tmpTableSizeMb;
       
@@ -79,16 +74,16 @@ in
       
       # InnoDB Log File Size: 25% of buffer pool (max 2GB)
       innodbLogFileSizeMb = lib.min 2048 (builtins.floor(innodbBufferPoolSizeMb * 0.25));
-      
+
       # Max Connections
       maxConnections = 50 + (numberOfSites * 30) + (cpus * 10);
-      
+
       # Thread Cache
       threadCacheSize = builtins.floor(maxConnections * 0.10);
-      
+
       # Table Open Cache
       tableOpenCache = 2000 + (numberOfSites * 200);
-      
+
       # InnoDB instances
       innodbBufferPoolInstances = lib.min 8 (lib.max 1 (builtins.floor(innodbBufferPoolSizeMb / 1024)));
 
@@ -105,16 +100,14 @@ in
         innodb_flush_method = "O_DIRECT";
         table_definition_cache = "4096";
       };
-      
+
       # --- Tuned Settings ---
       tunedSettings = {
         innodb_buffer_pool_size = "${toString innodbBufferPoolSizeMb}M";
         innodb_buffer_pool_instances = toString innodbBufferPoolInstances;
         innodb_log_file_size = "${toString innodbLogFileSizeMb}M";
         
-        query_cache_type = "1";
-        query_cache_limit = "2M";
-        query_cache_size = "${toString queryCacheSizeMb}M";
+        # Query Cache rimosso per compatibilità futura
         
         tmp_table_size = "${toString tmpTableSizeMb}M";
         max_heap_table_size = "${toString maxHeapTableSizeMb}M";
@@ -147,7 +140,7 @@ in
           defaultSettings
           (lib.mkIf cfg.autoTune.enable tunedSettings)
         ];
-        
+
         ensureDatabases = [];
         ensureUsers = [];
       };
@@ -172,7 +165,6 @@ in
         echo "   PHP-FPM RAM:        ${toString phpFpmRamMb}MB"
         echo "   DB Budget:          ${toString dbBudgetMb}MB"
         echo "   InnoDB Buffer Pool: ${toString innodbBufferPoolSizeMb}MB"
-        echo "   Query Cache:        ${toString queryCacheSizeMb}MB"
         echo "   Max Connections:    ${toString maxConnections}"
         echo "   Auto-Tuning:        ${if cfg.autoTune.enable then "✓ ENABLED" else "✗ DISABLED"}"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
