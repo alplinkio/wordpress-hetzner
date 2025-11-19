@@ -1,7 +1,7 @@
 {
   imports = [
-    ./hardware-detection.nix
     ./interface.nix
+    ./hardware-detection.nix
     ./mariadb.nix
     ./nginx.nix
     ./php-fpm.nix
