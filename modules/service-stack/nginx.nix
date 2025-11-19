@@ -8,17 +8,15 @@ let
   secCfg = config.services.wpbox.security;
   
   realIpsFromList = lib.strings.concatMapStringsSep "\n" (x: "set_real_ip_from  ${x};");
-  fileToList = x: lib.strings.splitString "\n" (builtins.readFile x);
   
-  cfipv4 = fileToList (pkgs.fetchurl {
-    url = "https://www.cloudflare.com/ips-v4";
-    sha256 = "0ywy9sg7spafi3gm9q5wb59lbiq0swvf0q3iazl0maq1pj1nsb7h";
-  });
+  fileToList = path: 
+    if builtins.pathExists path then
+      lib.strings.splitString "\n" (builtins.readFile path)
+    else
+      [];
   
-  cfipv6 = fileToList (pkgs.fetchurl {
-    url = "https://www.cloudflare.com/ips-v6";
-    sha256 = "1ad09hijignj6zlqvdjxv7rjj8567z357zfavv201b9vx3ikk7cy";
-  });
+  cfipv4Path = "/var/lib/nginx/cloudflare-ips-v4.txt";
+  cfipv6Path = "/var/lib/nginx/cloudflare-ips-v6.txt";
   
   # Cache skip conditions string
   cacheSkipDirectives = ''
@@ -42,21 +40,81 @@ let
   '';
 in
 {
-  config = mkIf (cfg.enable || wpCfg.enable) {
+  config = mkIf (config.services.wpbox.enable && cfg.enable) {
     
-    # Redirect http->https if SSL is enabled
-    server."http_redirect" = if cfg.enableSSL then {
-      listen = [ { addr = "0.0.0.0"; port = 80; } ];
-      serverName = builtins.concatSep " " (attrNames (filterAttrs (n: v: v.enabled) wpCfg.sites));
-      extraConfig = ''
-        return 301 https://$host$request_uri;
+    # ============================================================
+    # CLOUDFLARE IP UPDATE - SYSTEMD SERVICE + TIMER
+    # ============================================================
+    
+    systemd.tmpfiles.rules = [
+      "d /var/lib/nginx 0755 nginx nginx - -"
+      "d /var/log/nginx 0755 nginx nginx - -"
+      "d /var/spool/nginx 0750 nginx nginx -"
+    ];
+    
+    systemd.services.wpbox-cloudflare-ips = {
+      description = "Update Cloudflare IP ranges for Nginx real IP detection";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "nginx.service" ];
+      
+      serviceConfig = {
+        Type = "oneshot";
+        User = "root";
+        Group = "root";
+      };
+      
+      script = ''
+        echo "Updating Cloudflare IP ranges..."
+        
+        ${pkgs.curl}/bin/curl -s -f https://www.cloudflare.com/ips-v4 > ${cfipv4Path}.tmp
+        if [ $? -eq 0 ]; then
+          mv ${cfipv4Path}.tmp ${cfipv4Path}
+          echo "✓ IPv4 ranges updated"
+        else
+          echo "✗ Failed to download IPv4 ranges"
+          rm -f ${cfipv4Path}.tmp
+        fi
+        
+        ${pkgs.curl}/bin/curl -s -f https://www.cloudflare.com/ips-v6 > ${cfipv6Path}.tmp
+        if [ $? -eq 0 ]; then
+          mv ${cfipv6Path}.tmp ${cfipv6Path}
+          echo "✓ IPv6 ranges updated"
+        else
+          echo "✗ Failed to download IPv6 ranges"
+          rm -f ${cfipv6Path}.tmp
+        fi
+        
+        # Reload nginx se è attivo
+        if systemctl is-active --quiet nginx.service; then
+          echo "Reloading nginx configuration..."
+          systemctl reload nginx.service
+        fi
       '';
-    } else null;
-
+    };
+    
+    systemd.timers.wpbox-cloudflare-ips = {
+      description = "Daily Cloudflare IP Update Timer";
+      wantedBy = [ "timers.target" ];
+      
+      timerConfig = {
+        OnBootSec = "2min";       
+        OnUnitActiveSec = "24h"; 
+        Persistent = true;
+      };
+    };
+    
+    # ============================================================
+    # ACME / LET'S ENCRYPT CONFIGURATION
+    # ============================================================
+    
     security.acme = mkIf cfg.enableSSL {
       acceptTerms = true;
       defaults.email = cfg.acmeEmail;
     };
+    
+    # ============================================================
+    # NGINX SERVICE CONFIGURATION
+    # ============================================================
     
     services.nginx = {
       enable = true;
@@ -74,28 +132,48 @@ in
       sslCiphers = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384";
       sslProtocols = "TLSv1.2 TLSv1.3";
 
+      # ============================================================
+      # COMMON HTTP CONFIG (Log Format + Rate Limits)
+      # ============================================================
+      
       commonHttpConfig = ''
+        # Custom log format
+        log_format wpbox_enhanced '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" rt=$request_time uct="$upstream_connect_time" uht="$upstream_header_time" urt="$upstream_response_time" cf_ip="$http_cf_connecting_ip" real_ip="$remote_addr"';
+        
+        # Proxy settings
         proxy_headers_hash_max_size 2048;
         proxy_headers_hash_bucket_size 128;
         
         ${optionalString cfg.enableCloudflareRealIP ''
-        ${realIpsFromList cfipv4}
-        ${realIpsFromList cfipv6}
-        real_ip_header CF-Connecting-IP;
+        # Cloudflare Real IP detection (loaded from runtime files)
+        ${let
+          v4ips = fileToList cfipv4Path;
+          v6ips = fileToList cfipv6Path;
+        in
+          if (length v4ips > 0 || length v6ips > 0) then
+            realIpsFromList (v4ips ++ v6ips) + "\nreal_ip_header CF-Connecting-IP;"
+          else
+            "# Cloudflare IPs not loaded yet - will be populated by systemd service"
+        }
         ''}
         
         ${cacheSkipDirectives}
         
-        # Logging for debug cache
+        # Cache status header for debugging
         add_header X-Cache-Status $upstream_cache_status;
         
+        # Rate limiting zones
         limit_req_zone $binary_remote_addr zone=wp_general:10m rate=20r/s;
         limit_req_zone $binary_remote_addr zone=wp_bots:10m rate=5r/s;
-        limit_req_zone $binary_remote_addr zone=wp_admin:10m rate=5r/m; # Nota: rate basso per admin
+        limit_req_zone $binary_remote_addr zone=wp_admin:10m rate=10r/s;
         limit_req_zone $binary_remote_addr zone=wp_api:10m rate=30r/s;
         limit_req_zone $binary_remote_addr zone=wp_login:10m rate=5r/m;
         limit_req_zone $binary_remote_addr zone=wp_static:10m rate=100r/s;
       '';
+      
+      # ============================================================
+      # SECURITY HEADERS (Applied Globally)
+      # ============================================================
       
       appendHttpConfig = ''
         add_header X-Frame-Options "SAMEORIGIN" always;
@@ -103,206 +181,300 @@ in
         add_header X-XSS-Protection "1; mode=block" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
         add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
-        ${optionalString cfg.enableSSL ''add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;''}
+        ${optionalString cfg.enableSSL ''add_header Strict-Transport-Security "max-age=31536000; includeSubDomains${if cfg.enableHSTSPreload then "; preload" else ""}" always;''}
         add_header Content-Security-Policy "upgrade-insecure-requests" always;
       '';
+      
+      # ============================================================
+      # VIRTUAL HOSTS (HTTP Redirects + HTTPS)
+      # ============================================================
       
       virtualHosts = let
         activeSites = filterAttrs (n: v: v.enabled) wpCfg.sites;
         phpfpmSocket = name: "unix:${config.services.phpfpm.pools."wordpress-${name}".socket}";
-      in
-      mapAttrs (name: siteOpts: {
-        serverName = name;
-        forceSSL = cfg.enableSSL;
-        enableACME = cfg.enableSSL;
-        root = "/var/lib/wordpress/${name}/";
         
-        extraConfig = ''
-          access_log /var/log/nginx/${name}-access.log wpbox_enhanced;
-          error_log /var/log/nginx/${name}-error.log warn;
-          client_max_body_size ${siteOpts.nginx.client_max_body_size};
-          client_body_buffer_size 128k;
-          client_body_timeout 12s;
-          client_header_timeout 12s;
-          send_timeout 10s;
-          fastcgi_buffers 16 16k;
-          fastcgi_buffer_size 32k;
-          fastcgi_connect_timeout 60s;
-          fastcgi_send_timeout 180s;
-          fastcgi_read_timeout 180s;
-        '';
+        # HTTP → HTTPS Redirect hosts (solo se SSL è abilitato)
+        httpRedirects = mkIf cfg.enableSSL (
+          mapAttrs' (name: _: nameValuePair "${name}-http-redirect" {
+            serverName = name;
+            listen = [
+              { addr = "0.0.0.0"; port = 80; }
+              { addr = "[::]"; port = 80; }
+            ];
+            locations."/" = {
+              return = "301 https://$host$request_uri";
+            };
+          }) activeSites
+        );
         
-        locations = {
+        # HTTPS Virtual Hosts main config
+        httpsHosts = mapAttrs (name: siteOpts: {
+          serverName = name;
           
-          "/" = {
-            index = "index.php index.html";
-            tryFiles = "$uri $uri/ /index.php?$args";
-            extraConfig = ''
-              limit_req zone=wp_general burst=40 nodelay;
-              limit_req zone=wp_bots burst=5 nodelay;
-              limit_req_status 429;
-              more_set_headers "X-RateLimit-Zone: general";
-              more_set_headers "X-RateLimit-Limit: 20r/s";
-            '';
-          };
+          # SSL Configuration
+          forceSSL = cfg.enableSSL;
+          enableACME = cfg.enableSSL;
           
-          "~ \\.php$" = {
-            extraConfig = ''
-              try_files $uri =404;
-              fastcgi_split_path_info ^(.+\.php)(/.+)$;
-              fastcgi_pass ${phpfpmSocket name};
-              fastcgi_index index.php;
-              include ${pkgs.nginx}/conf/fastcgi.conf;
-              fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-              fastcgi_param PATH_INFO $fastcgi_path_info;
-              fastcgi_param HTTP_PROXY "";
-              fastcgi_intercept_errors off;
-              fastcgi_read_timeout ${toString siteOpts.php.max_execution_time}s;
-              fastcgi_send_timeout ${toString siteOpts.php.max_execution_time}s;
-              fastcgi_buffering on;
-              fastcgi_buffers 16 16k;
-              fastcgi_buffer_size 32k;
-              limit_req zone=wp_general burst=20 nodelay;
-              limit_req_status 429;
-            '';
-          };
+          # Document root
+          root = "/var/lib/wordpress/${name}/";
           
-          "~ ^/wp-admin/" = {
-            index = "index.php";
-            tryFiles = "$uri $uri/ /wp-admin/index.php?$args";
-            extraConfig = ''
-              limit_req zone=wp_admin burst=20 nodelay;
-              limit_req_status 429;
-              more_set_headers "X-RateLimit-Zone: wp-admin";
-            '';
-          };
+          extraConfig = ''
+            access_log /var/log/nginx/${name}-access.log wpbox_enhanced;
+            error_log /var/log/nginx/${name}-error.log warn;
+            
+            # Client settings
+            client_max_body_size ${siteOpts.nginx.client_max_body_size};
+            client_body_buffer_size 128k;
+            client_body_timeout 12s;
+            client_header_timeout 12s;
+            send_timeout 10s;
+            
+            # FastCGI buffers
+            fastcgi_buffers 16 16k;
+            fastcgi_buffer_size 32k;
+            fastcgi_connect_timeout 60s;
+            fastcgi_send_timeout 180s;
+            fastcgi_read_timeout 180s;
+          '';
           
-          "~ ^/wp-json/" = {
-            extraConfig = ''
-              limit_req zone=wp_api burst=60 nodelay;
-              limit_req_status 429;
-              more_set_headers "X-RateLimit-Zone: wp-api";
-              more_set_headers "X-RateLimit-Limit: 30r/s";
-              try_files $uri $uri/ /index.php?$args;
-            '';
-          };
-          
-          "= /wp-admin/admin-ajax.php" = {
-            extraConfig = ''
-              limit_req zone=wp_api burst=60 nodelay;
-              limit_req_status 429;
-              fastcgi_pass ${phpfpmSocket name};
-              include ${pkgs.nginx}/conf/fastcgi.conf;
-              fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-              fastcgi_param HTTP_PROXY "";
-            '';
-          };
-          
-          "/wp-content/" = {
-            alias = "/var/lib/wordpress/${name}/wp-content/";
-            extraConfig = ''
-              limit_req zone=wp_static burst=200 nodelay;
-              expires 7d;
-              log_not_found off;
-              access_log off;
-              location ~* ^/wp-content/.*\.php$ {
+          locations = {
+            
+            # ============================================================
+            # ROOT LOCATION
+            # ============================================================
+            
+            "/" = {
+              index = "index.php index.html";
+              tryFiles = "$uri $uri/ /index.php?$args";
+              extraConfig = ''
+                limit_req zone=wp_general burst=40 nodelay;
+                limit_req zone=wp_bots burst=5 nodelay;
+                limit_req_status 429;
+                more_set_headers "X-RateLimit-Zone: general";
+                more_set_headers "X-RateLimit-Limit: 20r/s";
+              '';
+            };
+            
+            # ============================================================
+            # PHP HANDLER
+            # ============================================================
+            
+            "~ \\.php$" = {
+              extraConfig = ''
+                try_files $uri =404;
+                fastcgi_split_path_info ^(.+\.php)(/.+)$;
+                fastcgi_pass ${phpfpmSocket name};
+                fastcgi_index index.php;
+                include ${pkgs.nginx}/conf/fastcgi.conf;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                fastcgi_param PATH_INFO $fastcgi_path_info;
+                fastcgi_param HTTP_PROXY "";
+                fastcgi_intercept_errors off;
+                fastcgi_read_timeout ${toString siteOpts.php.max_execution_time}s;
+                fastcgi_send_timeout ${toString siteOpts.php.max_execution_time}s;
+                fastcgi_buffering on;
+                fastcgi_buffers 16 16k;
+                fastcgi_buffer_size 32k;
+                limit_req zone=wp_general burst=20 nodelay;
+                limit_req_status 429;
+              '';
+            };
+            
+            # ============================================================
+            # WORDPRESS ADMIN AREA
+            # ============================================================
+            
+            "~ ^/wp-admin/" = {
+              index = "index.php";
+              tryFiles = "$uri $uri/ /wp-admin/index.php?$args";
+              extraConfig = ''
+                limit_req zone=wp_admin burst=20 nodelay;
+                limit_req_status 429;
+                more_set_headers "X-RateLimit-Zone: wp-admin";
+              '';
+            };
+            
+            # ============================================================
+            # WORDPRESS REST API
+            # ============================================================
+            
+            "~ ^/wp-json/" = {
+              extraConfig = ''
+                limit_req zone=wp_api burst=60 nodelay;
+                limit_req_status 429;
+                more_set_headers "X-RateLimit-Zone: wp-api";
+                more_set_headers "X-RateLimit-Limit: 30r/s";
+                try_files $uri $uri/ /index.php?$args;
+              '';
+            };
+            
+            # ============================================================
+            # WORDPRESS ADMIN AJAX
+            # ============================================================
+            
+            "= /wp-admin/admin-ajax.php" = {
+              extraConfig = ''
+                limit_req zone=wp_api burst=60 nodelay;
+                limit_req_status 429;
+                fastcgi_pass ${phpfpmSocket name};
+                include ${pkgs.nginx}/conf/fastcgi.conf;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                fastcgi_param HTTP_PROXY "";
+              '';
+            };
+            
+            # ============================================================
+            # WP-CONTENT (Uploads, Themes, Plugins)
+            # ============================================================
+            
+            "/wp-content/" = {
+              alias = "/var/lib/wordpress/${name}/wp-content/";
+              extraConfig = ''
+                limit_req zone=wp_static burst=200 nodelay;
+                expires 7d;
+                log_not_found off;
+                access_log off;
+                
+                # Block PHP execution in wp-content
+                location ~* ^/wp-content/.*\.php$ {
+                  deny all;
+                }
+                
+                # Block dangerous file types in uploads
+                location ~* ^/wp-content/uploads/.*\.(php|phtml|php3|php4|php5|php7|phar|exe|pl|sh|py)$ {
+                  deny all;
+                }
+              '';
+            };
+            
+            # ============================================================
+            # STATIC ASSETS (CSS, JS, Images, Fonts)
+            # ============================================================
+            
+            "~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp|avif)$" = {
+              extraConfig = ''
+                limit_req zone=wp_static burst=200 nodelay;
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+                log_not_found off;
+                access_log off;
+                
+                # CORS for fonts
+                location ~* \.(woff|woff2|ttf|eot)$ {
+                  add_header Access-Control-Allow-Origin "*";
+                }
+              '';
+            };
+            
+            # ============================================================
+            # SECURITY: Block hidden files
+            # ============================================================
+            
+            "~ /\\." = {
+              extraConfig = "deny all;";
+            };
+            
+            # ============================================================
+            # SECURITY: Block wp-config.php
+            # ============================================================
+            
+            "~ wp-config\\.php" = {
+              extraConfig = "deny all;";
+            };
+            
+            # ============================================================
+            # SECURITY: Block sensitive file types
+            # ============================================================
+            
+            "~* \\.(bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist|md|txt)$" = {
+              extraConfig = "deny all;";
+            };
+            
+            # ============================================================
+            # SECURITY: Block xmlrpc.php (prevents DDoS)
+            # ============================================================
+            
+            "= /xmlrpc.php" = {
+              extraConfig = "deny all;";
+            };
+            
+            # ============================================================
+            # WP-LOGIN (Heavy rate limiting)
+            # ============================================================
+            
+            "= /wp-login.php" = {
+              extraConfig = ''
+                limit_req zone=wp_login burst=3 nodelay;
+                limit_req_status 429;
+                access_log /var/log/nginx/${name}-login.log wpbox_enhanced;
+                more_set_headers "X-RateLimit-Zone: login";
+                more_set_headers "X-RateLimit-Limit: 5r/m";
+                fastcgi_pass ${phpfpmSocket name};
+                include ${pkgs.nginx}/conf/fastcgi.conf;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                fastcgi_param HTTP_PROXY "";
+              '';
+            };
+            
+            # ============================================================
+            # WP-CRON (Local only)
+            # ============================================================
+            
+            "= /wp-cron.php" = {
+              extraConfig = ''
+                allow 127.0.0.1;
+                allow ::1;
                 deny all;
-              }
-              location ~* ^/wp-content/uploads/.*\.(php|phtml|php3|php4|php5|php7|phar|exe|pl|sh|py)$ {
-                deny all;
-              }
-            '';
-          };
+              '';
+            };
+            
+            # ============================================================
+            # SECURITY: Block install/upgrade scripts
+            # ============================================================
+            
+            "~* ^/(install|upgrade)\\.php$" = {
+              extraConfig = "deny all;";
+            };
+            
+            # ============================================================
+            # SECURITY: Block direct access to wp-includes PHP files
+            # ============================================================
+            
+            "~* ^/wp-includes/.*\\.php$" = {
+              extraConfig = "deny all;";
+            };
+            
+            # ============================================================
+            # SECURITY: Block readme/license files
+            # ============================================================
+            
+            "~* ^/(readme|license|changelog)\\.(html|txt)$" = {
+              extraConfig = "deny all;";
+            };
+            
+          } // (siteOpts.nginx.custom_locations or {});
           
-          "~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|webp|avif)$" = {
-            extraConfig = ''
-              limit_req zone=wp_static burst=200 nodelay;
-              expires 1y;
-              add_header Cache-Control "public, immutable";
-              log_not_found off;
-              access_log off;
-              location ~* \.(woff|woff2|ttf|eot)$ {
-                add_header Access-Control-Allow-Origin "*";
-              }
-            '';
-          };
-          
-          "~ /\\." = {
-            extraConfig = "deny all;";
-          };
-          
-          "~ wp-config\\.php" = {
-            extraConfig = "deny all;";
-          };
-          
-          "~* \\.(bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist|md|txt)$" = {
-            extraConfig = "deny all;";
-          };
-          
-          "= /xmlrpc.php" = {
-            extraConfig = ''
-              deny all;
-            '';
-          };
-          
-          "= /wp-login.php" = {
-            extraConfig = ''
-              limit_req zone=wp_login burst=3 nodelay;
-              limit_req_status 429;
-              access_log /var/log/nginx/${name}-login.log wpbox_enhanced;
-              more_set_headers "X-RateLimit-Zone: login";
-              more_set_headers "X-RateLimit-Limit: 5r/m";
-              fastcgi_pass ${phpfpmSocket name};
-              include ${pkgs.nginx}/conf/fastcgi.conf;
-              fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-              fastcgi_param HTTP_PROXY "";
-            '';
-          };
-          
-          "= /wp-cron.php" = {
-            extraConfig = ''
-              allow 127.0.0.1;
-              deny all;
-            '';
-          };
-          
-          "~* ^/(install|upgrade)\\.php$" = {
-            extraConfig = "deny all;";
-          };
-          
-          "~* ^/wp-includes/.*\\.php$" = {
-            extraConfig = "deny all;";
-          };
-          
-          "~* ^/(readme|license|changelog)\\.(html|txt)$" = {
-            extraConfig = "deny all;";
-          };
-        } // siteOpts.nginx.custom_locations;
+        }) activeSites;
         
-      }) activeSites;
+      # Merge HTTP redirects + HTTPS hosts
+      in httpsHosts // httpRedirects;
+    };
 
-      log_format = {
-        wpbox_enhanced = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" rt=$request_time uct="$upstream_connect_time" uht="$upstream_header_time" urt="$upstream_response_time" cf_ip="$http_cf_connecting_ip" real_ip="$remote_addr"';
-      };
-
-      # Logrotate settings
-      services.logrotate.settings.nginx = {
-        files = "/var/log/nginx/*.log";
-        frequency = "daily";
-        rotate = 14;
-        compress = true;
-        delaycompress = true;
-        notifempty = true;
-        sharedscripts = true;
-        postrotate = ''
-          [ -f /var/run/nginx/nginx.pid ] && kill -USR1 $(cat /var/run/nginx/nginx.pid)
-        '';
-      };
-
-      systemd.tmpfiles.rules = [
-        "d /var/log/nginx 0755 nginx nginx - -"
-        "d /var/spool/nginx 0750 nginx nginx -"
-      ];
+    # ============================================================
+    # LOG ROTATION
+    # ============================================================
+    
+    services.logrotate.settings.nginx = {
+      files = "/var/log/nginx/*.log";
+      frequency = "daily";
+      rotate = 14;
+      compress = true;
+      delaycompress = true;
+      notifempty = true;
+      sharedscripts = true;
+      postrotate = ''
+        [ -f /var/run/nginx/nginx.pid ] && kill -USR1 $(cat /var/run/nginx/nginx.pid)
+      '';
     };
   };
 }
